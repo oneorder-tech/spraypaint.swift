@@ -251,10 +251,7 @@ public extension JapxKit.Encoder {
     ///
     /// - returns: JSON:API object.
     static func encode(data: Data, additionalParams: Parameters? = nil, options: JapxKit.Encoder.Options = .default) throws -> Parameters {
-        print("Michael")
-        print(data)
         let json = try JSONSerialization.jsonObject(with: data)
-        print(json)
         if let jsonObject = json as? Parameters {
             return try encode(json: jsonObject, additionalParams: additionalParams, options: options)
         }
