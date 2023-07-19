@@ -27,6 +27,13 @@ public enum JapxError: Error {
     case unableToConvertDataToJson(data: Any)
 }
 
+public struct SidePosting {
+    public static let create = "create"
+    public static let update = "update"
+    public static let destroy = "destroy"
+    public static let disassoiate = "disassoiate"
+}
+
 private struct Consts {
     
     struct APIKeys {
@@ -37,6 +44,8 @@ private struct Consts {
         static let relationships = "relationships"
         static let attributes = "attributes"
         static let meta = "meta"
+        static let method = "method"
+        static let temp_id = "temp-id"
     }
     
     struct General {
@@ -242,7 +251,10 @@ public extension JapxKit.Encoder {
     ///
     /// - returns: JSON:API object.
     static func encode(data: Data, additionalParams: Parameters? = nil, options: JapxKit.Encoder.Options = .default) throws -> Parameters {
+        print("Michael")
+        print(data)
         let json = try JSONSerialization.jsonObject(with: data)
+        print(json)
         if let jsonObject = json as? Parameters {
             return try encode(json: jsonObject, additionalParams: additionalParams, options: options)
         }
@@ -261,7 +273,13 @@ public extension JapxKit.Encoder {
     /// - returns: JSON:API object.
     static func encode(json: Parameters, additionalParams: Parameters? = nil, options: JapxKit.Encoder.Options = .default) throws -> Parameters {
         var params = additionalParams ?? [:]
-        params[Consts.APIKeys.data] = try encodeAttributesAndRelationships(on: json, options: options)
+        var inclueded: [Parameters] = []
+        
+        params[Consts.APIKeys.data] = try encodeAttributesAndRelationships(on: json, options: options, included: &inclueded)
+        
+        if !inclueded.isEmpty {
+            params[Consts.APIKeys.included] = inclueded
+        }
         return params
     }
     
@@ -274,7 +292,14 @@ public extension JapxKit.Encoder {
     /// - returns: JSON:API object.
     static func encode(json: [Parameters], additionalParams: Parameters? = nil, options: JapxKit.Encoder.Options = .default) throws -> Parameters {
         var params = additionalParams ?? [:]
-        params[Consts.APIKeys.data] = try json.compactMap { try encodeAttributesAndRelationships(on: $0, options: options) as AnyObject }
+        
+        var inclueded: [Parameters] = []
+        
+        params[Consts.APIKeys.data] = try json.compactMap { try encodeAttributesAndRelationships(on: $0, options: options, included: &inclueded) as AnyObject }
+        
+        if !inclueded.isEmpty {
+            params[Consts.APIKeys.included] = inclueded
+        }
         return params
     }
 }
@@ -495,54 +520,42 @@ private extension JapxKit.Decoder {
 
 private extension JapxKit.Encoder {
     
-    static func encodeAttributesAndRelationships(on jsonObject: Parameters, options: JapxKit.Encoder.Options) throws -> Parameters {
+    static func encodeAttributesAndRelationships(
+        on jsonObject: Parameters,
+        options: JapxKit.Encoder.Options,
+        included: inout [Parameters]
+    ) throws -> Parameters {
         var object = jsonObject
         var attributes = Parameters()
         var relationships = Parameters()
         let objectKeys = object.keys
         
-        let relationshipExtractor = extractRelationshipData(
-            includeMetaToCommonNamespce: options.includeMetaToCommonNamespce
-        )
+        let relationshipExtractor = extractRelationshipData(includeMetaToCommonNamespce: options.includeMetaToCommonNamespce)
         
         let isRelationship = testIsRelationship(relationshipList: options.relationshipList)
         
-        for key in objectKeys where key != Consts.APIKeys.type && key != Consts.APIKeys.id {
+        for key in objectKeys where key != Consts.APIKeys.type && key != Consts.APIKeys.id && key != Consts.APIKeys.method {
             
             if options.includeMetaToCommonNamespce && key == Consts.APIKeys.meta {
                 continue
             }
             
-            if let array = object.asArray(from: key) {
-                
-                let isArrayOfRelationships = try isRelationship((key: key, object: array.first))
-                if !isArrayOfRelationships {
-                    // Handle attributes array
-                    attributes[key] = array
-                    object.removeValue(forKey: key)
-                    continue
-                }
-                let dataArray = try array.map(relationshipExtractor)
-                // Handle relationships array
-                relationships[key] = [Consts.APIKeys.data: dataArray]
-                object.removeValue(forKey: key)
+            if var array = object.asArray(from: key) {
+                try encodeArrayAttributesAndRelationships(object: &object, key: key, relationships: &relationships, attributes: &attributes, array: &array, included: &included, relationshipExtractor: relationshipExtractor, isRelationship: isRelationship)
                 continue
             }
             if let obj = object.asDictionary(from: key) {
-                if try !isRelationship((key: key, object: obj)) {
-                    // Handle attributes object
-                    attributes[key] = obj
-                    object.removeValue(forKey: key)
-                    continue
-                }
-                let dataObj = try relationshipExtractor(obj)
-                // Handle relationship object
-                relationships[key] = [Consts.APIKeys.data: dataObj]
-                object.removeValue(forKey: key)
+                try encodeObjectAttributesAndRelationships(object: &object, obj: obj, key: key, relationships: &relationships, attributes: &attributes, included: &included, relationshipExtractor: relationshipExtractor, isRelationship: isRelationship)
                 continue
             }
             attributes[key] = object[key]
             object.removeValue(forKey: key)
+            //remove method and id if method is SidePosting.create
+            let method = object.removeValue(forKey: Consts.APIKeys.method) as? String
+            if method == SidePosting.create {
+                let idValue = object.removeValue(forKey: Consts.APIKeys.id)
+                object[Consts.APIKeys.temp_id] = idValue
+            }
         }
         object[Consts.APIKeys.attributes] = attributes
         
@@ -553,16 +566,93 @@ private extension JapxKit.Encoder {
         return object
     }
     
+    
+    private static func encodeObjectAttributesAndRelationships(
+        object: inout [String: Any],
+        obj: Parameters,
+        key: String,
+        relationships: inout Parameters,
+        attributes: inout Parameters,
+        included: inout [Parameters],
+        relationshipExtractor: (Parameters) throws -> (Any),
+        isRelationship: (KeyObjectPair) throws -> Bool
+    ) throws {
+        if try !isRelationship((key: key, object: obj)) {
+            // Handle attributes object
+            attributes[key] = obj
+            object.removeValue(forKey: key)
+            return
+        }
+        let dataObj = try relationshipExtractor(obj)
+        // Handle relationship object
+        relationships[key] = [Consts.APIKeys.data: dataObj]
+        //TODO:: add data to included if method is update or create
+        let method = obj[Consts.APIKeys.method] as? String
+        if method == SidePosting.create || method == SidePosting.update {
+            let objData = try encodeAttributesAndRelationships(
+                on: obj,
+                options: JapxKit.Encoder.Options(
+                    includeMetaToCommonNamespce: false,
+                    relationshipList: nil,
+                    includeEmptyRelationships: false
+                ),
+                included: &included
+            )
+            included.append(objData)
+        }
+        object.removeValue(forKey: key)
+    }
+    
+    private static func encodeArrayAttributesAndRelationships(
+        object: inout [String: Any],
+        key: String,
+        relationships: inout Parameters,
+        attributes: inout Parameters,
+        array: inout [Parameters],
+        included: inout [Parameters],
+        relationshipExtractor: (Parameters) throws -> (Any),
+        isRelationship: (KeyObjectPair) throws -> Bool
+    ) throws {
+        let isArrayOfRelationships = try isRelationship((key: key, object: array.first))
+        if !isArrayOfRelationships {
+            // Handle attributes array
+            attributes[key] = array
+            object.removeValue(forKey: key)
+            return
+        }
+        let dataArray = try array.map(relationshipExtractor)
+        // Handle relationships array
+        relationships[key] = [Consts.APIKeys.data: dataArray]
+        //TODO::
+        for obj in array {
+            let method = obj[Consts.APIKeys.method] as? String
+            if method == SidePosting.create || method == SidePosting.update {
+                let objData = try encodeAttributesAndRelationships(
+                    on: obj,
+                    options: JapxKit.Encoder.Options(
+                        includeMetaToCommonNamespce: false,
+                        relationshipList: nil,
+                        includeEmptyRelationships: false
+                    ),
+                    included: &included
+                )
+                included.append(objData)
+            }
+        }
+        object.removeValue(forKey: key)
+    }
+    
     typealias KeyObjectPair = (key: String, object: Parameters?)
     static func testIsRelationship(relationshipList: String?) -> (KeyObjectPair) throws -> Bool {
         guard let relationshipList = relationshipList else {
-            return { $0.object?.containsTypeAndId() ?? false }
+            //TODO::
+            return { $0.object?.containsType() ?? false }
         }
         let list = relationshipList
             .components(separatedBy: ",")
             .compactMap { $0.components(separatedBy: ".").first }
         return {
-            switch (list.contains($0.key), $0.object?.containsTypeAndId()) {
+            switch (list.contains($0.key), $0.object?.containsType()) {
             case (let containsInList, nil):
                 return containsInList
             case (true, true?): return true
@@ -574,10 +664,10 @@ private extension JapxKit.Encoder {
     
     static func extractRelationshipData(includeMetaToCommonNamespce: Bool) -> (Parameters) throws -> (Any) {
         if !includeMetaToCommonNamespce {
-            return { try $0.asDataWithTypeAndId() }
+            return { try $0.asRelationshipData() }
         }
         return { object in
-            var params = try object.asDataWithTypeAndId()
+            var params = try object.asRelationshipData()
             if let meta = object[Consts.APIKeys.meta] {
                 params[Consts.APIKeys.meta] = meta
             }
@@ -621,11 +711,29 @@ private extension Dictionary where Key == String {
         return keys.contains(Consts.APIKeys.type) && keys.contains(Consts.APIKeys.id)
     }
     
-    func asDataWithTypeAndId() throws -> Parameters {
+    func containsType() -> Bool {
+        return keys.contains(Consts.APIKeys.type)
+    }
+    
+    func asRelationshipData() throws -> Parameters {
         guard let type = self[Consts.APIKeys.type], let id = self[Consts.APIKeys.id] else {
             throw JapxError.notFoundTypeOrId(data: self)
         }
-        return [Consts.APIKeys.type: type, Consts.APIKeys.id: id]
+        var relationshipMap = [Consts.APIKeys.type: type]
+        
+        let method = self[Consts.APIKeys.method] as? String
+        
+        if method != nil {
+            relationshipMap[Consts.APIKeys.method] = method as? Value
+        }
+        
+        if method == SidePosting.create {
+            relationshipMap[Consts.APIKeys.temp_id] = id
+        } else {
+            relationshipMap[Consts.APIKeys.id] = id
+        }
+        
+        return relationshipMap
     }
     
     func extractTypeIdPair() throws -> TypeIdPair {
